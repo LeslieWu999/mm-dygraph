@@ -22,6 +22,7 @@ from models.modules import MergeLayer, MLPClassifier_edge
 from models.TCL import TCL
 from models.TGAT import TGAT
 from models.TPNet import TPNet
+from utils.raw_feature_utils import FixedFeatureSource, build_feature_sources, concat_or_single
 
 # SALoM's upstream class is called Liquid.
 MEMORY_MODEL_NAMES = {"JODIE", "DyRep", "TGN", "Liquid"}
@@ -54,7 +55,17 @@ FUSION_WRAPPER_NAMES = {"gated_fusion", "modality_attention", "unigraph2"}
 WRAPPER_NAMES = sorted(set(WRAPPER_REGISTRY) | FUSION_WRAPPER_NAMES)
 
 
-def build_model(*, task_name: str, args, node_raw_features_list, edge_raw_features_list, neighbor_sampler, train_data, cat_num: int) -> nn.Sequential:
+def build_model(
+    *,
+    task_name: str,
+    args,
+    node_raw_features_list,
+    edge_raw_features_list,
+    neighbor_sampler,
+    train_data,
+    cat_num: int,
+    feature_metadata: dict | None = None,
+) -> nn.Sequential:
     """Returns ``nn.Sequential(backbone, task_head)``."""
     wrapper_class = _build_fusion_wrapper_class(args) if args.wrapper_name in FUSION_WRAPPER_NAMES else WRAPPER_REGISTRY[args.wrapper_name]
     model_kwargs = _build_backbone_kwargs(
@@ -65,9 +76,65 @@ def build_model(*, task_name: str, args, node_raw_features_list, edge_raw_featur
         edge_raw_features_list=edge_raw_features_list,
     )
     backbone = wrapper_class(BACKBONE_REGISTRY[args.model_name], node_raw_features_list, edge_raw_features_list, **model_kwargs)
+    _attach_missing_image_learned_embedding_support(
+        backbone=backbone,
+        wrapper_name=args.wrapper_name,
+        node_raw_features_list=node_raw_features_list,
+        edge_raw_features_list=edge_raw_features_list,
+        feature_metadata=feature_metadata,
+    )
     embedding_dim = _get_backbone_output_dim(args.wrapper_name, node_raw_features_list, backbone)
     head = _build_head(task_name=task_name, embedding_dim=embedding_dim, dropout=args.dropout, cat_num=cat_num)
     return nn.Sequential(backbone, head)
+
+
+def _attach_missing_image_learned_embedding_support(
+    *,
+    backbone: nn.Module,
+    wrapper_name: str,
+    node_raw_features_list,
+    edge_raw_features_list,
+    feature_metadata: dict | None,
+) -> None:
+    node_sources = build_feature_sources(node_raw_features_list, feature_metadata, "node")
+    edge_sources = build_feature_sources(edge_raw_features_list, feature_metadata, "edge")
+    if node_sources is None and edge_sources is None:
+        return
+
+    if node_sources is not None:
+        backbone.lme_node_feature_sources = nn.ModuleList(node_sources)
+    if edge_sources is not None:
+        backbone.lme_edge_feature_sources = nn.ModuleList(edge_sources)
+
+    if isinstance(backbone, FusionWrapper):
+        if node_sources is not None:
+            backbone._node_view.replace_modalities(node_sources)
+        if edge_sources is not None:
+            backbone._edge_view.replace_modalities(edge_sources)
+        return
+
+    full_node_features = concat_or_single(node_sources)
+    full_edge_features = concat_or_single(edge_sources)
+    if hasattr(backbone, "node_raw_features_list") and node_sources is not None:
+        backbone.node_raw_features_list = list(node_sources)
+    if hasattr(backbone, "edge_raw_features_list") and edge_sources is not None:
+        backbone.edge_raw_features_list = list(edge_sources)
+
+    target = backbone.model if wrapper_name == "concat" and hasattr(backbone, "model") else backbone
+    _assign_feature_sources(target, node_features=full_node_features, edge_features=full_edge_features)
+
+
+def _assign_feature_sources(target: nn.Module, *, node_features=None, edge_features=None) -> None:
+    holders = [
+        module
+        for module in target.modules()
+        if hasattr(module, "node_raw_features") or hasattr(module, "edge_raw_features")
+    ]
+    for module in holders:
+        if node_features is not None and hasattr(module, "node_raw_features"):
+            module.node_raw_features = node_features
+        if edge_features is not None and hasattr(module, "edge_raw_features"):
+            module.edge_raw_features = edge_features
 
 
 def _build_fusion_wrapper_class(args):
@@ -383,13 +450,21 @@ def offload_feature_tables(model: nn.Module, device, min_numel: int = 1_000_000)
         return converted[key]
 
     for module in model.modules():
+        if isinstance(module, FixedFeatureSource):
+            value = module.__dict__.get("_buffers", {}).get("features")
+            if torch.is_tensor(value) and value.numel() >= min_numel:
+                del module._buffers["features"]
+                module.features = host(value)
         for name in ("node_raw_features", "edge_raw_features"):
             value = module.__dict__.get(name)
             if torch.is_tensor(value) and value.numel() >= min_numel:
                 module.__dict__[name] = host(value)
         tables = module.__dict__.get("node_raw_features_list")
         if tables is not None:
-            module.__dict__["node_raw_features_list"] = [host(table) if table.numel() >= min_numel else table for table in tables]
+            module.__dict__["node_raw_features_list"] = [
+                host(table) if torch.is_tensor(table) and table.numel() >= min_numel else table
+                for table in tables
+            ]
         if isinstance(module, FusedFeatureView):
             for i in range(module.num_modalities):
                 buffer = module._buffers.pop(f"modality_{i}", None)

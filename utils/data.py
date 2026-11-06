@@ -62,7 +62,8 @@ def load_temporal_dataset(*, dataset_name: str, val_ratio: float, test_ratio: fl
     """Loads a dataset.
 
     Returns (node_features_list, edge_features_list, full_data, train_data, val_data, test_data,
-    new_node_val_data, new_node_test_data, category_count), with one feature table per modality.
+    new_node_val_data, new_node_test_data, category_count, feature_metadata), with one feature table
+    per modality. ``feature_metadata`` is only populated for learnable missing-modality features.
     """
     graph_df, npy_dir = _load_graph_df(dataset_name, data_root)
     node_count = int(max(graph_df["u"].max(), graph_df["i"].max()) + 1)
@@ -71,16 +72,29 @@ def load_temporal_dataset(*, dataset_name: str, val_ratio: float, test_ratio: fl
 
     node_raw_features_list: list[np.ndarray] = []
     edge_raw_features_list: list[np.ndarray] = []
+    feature_metadata = {}
     for token in feature_spec.split("+"):
-        node_features, edge_features = _load_feature_pair(
+        node_features, edge_features, pair_metadata = _load_feature_pair(
             dataset_name=dataset_name,
             npy_dir=npy_dir,
             feature_name=token.strip(),
             node_count=node_count,
             edge_feature_count=edge_feature_count,
         )
+        modality_index = len(node_raw_features_list)
         node_raw_features_list.append(node_features)
         edge_raw_features_list.append(edge_features)
+        if pair_metadata is not None:
+            feature_metadata["node"] = {
+                "modality_index": modality_index,
+                "missing_mask": pair_metadata["node_missing_mask"],
+                "init_embedding": pair_metadata["node_init_embedding"],
+            }
+            feature_metadata["edge"] = {
+                "modality_index": modality_index,
+                "missing_mask": pair_metadata["edge_missing_mask"],
+                "init_embedding": pair_metadata["edge_init_embedding"],
+            }
 
     splits = _split_temporal_graph(graph_df, val_ratio=val_ratio, test_ratio=test_ratio)
     return (
@@ -93,6 +107,7 @@ def load_temporal_dataset(*, dataset_name: str, val_ratio: float, test_ratio: fl
         splits["new_node_val_data"],
         splits["new_node_test_data"],
         category_count,
+        feature_metadata or None,
     )
 
 
@@ -125,13 +140,16 @@ def _resolve_dataset_assets(dataset_name: str, data_root: str | None) -> tuple[P
     )
 
 
-def _load_feature_pair(*, dataset_name: str, npy_dir: Path, feature_name: str, node_count: int, edge_feature_count: int) -> tuple[np.ndarray, np.ndarray]:
+def _load_feature_pair(
+    *, dataset_name: str, npy_dir: Path, feature_name: str, node_count: int, edge_feature_count: int
+) -> tuple[np.ndarray, np.ndarray, dict | None]:
+    pair_metadata = None
     if feature_name == "rand":
         node_features = np.load(npy_dir / "e_feat_ran.npy")
         edge_features = np.load(npy_dir / "r_feat_ran.npy")
         node_features = _pad_feature_dim(node_features, _target_dim_for_loaded_features(node_features))
         edge_features = _pad_feature_dim(edge_features, _target_dim_for_loaded_features(edge_features))
-    elif feature_name in {"text", "image"}:
+    elif feature_name in {"text", "image", "image_zero", "image_mean", "image_learned"}:
         # The first half of each row holds the text embedding, the second half the image embedding.
         full_edge_features = np.load(npy_dir / "r_feat_cat.npy")
         full_node_features = np.load(npy_dir / "e_feat_cat.npy")
@@ -140,20 +158,107 @@ def _load_feature_pair(*, dataset_name: str, npy_dir: Path, feature_name: str, n
         if feature_name == "text":
             edge_features = full_edge_features[:, :midpoint_edge]
             node_features = full_node_features[:, :midpoint_node]
-        else:
+        elif feature_name == "image":
             edge_features = full_edge_features[:, midpoint_edge:]
             node_features = full_node_features[:, midpoint_node:]
+        else:
+            node_features, edge_features, pair_metadata = _build_missing_image_features(
+                node_cat_features=full_node_features,
+                edge_cat_features=full_edge_features,
+                node_midpoint=midpoint_node,
+                edge_midpoint=midpoint_edge,
+                mode=feature_name,
+            )
         node_features = _pad_feature_dim(node_features, SINGLE_MODALITY_DIM)
         edge_features = _pad_feature_dim(edge_features, SINGLE_MODALITY_DIM)
+        if pair_metadata is not None:
+            pair_metadata["node_init_embedding"] = _pad_feature_vector(
+                pair_metadata["node_init_embedding"], node_features.shape[1]
+            )
+            pair_metadata["edge_init_embedding"] = _pad_feature_vector(
+                pair_metadata["edge_init_embedding"], edge_features.shape[1]
+            )
     else:
-        raise ValueError(f"Unsupported feature '{feature_name}': expected one of rand, text, image.")
+        raise ValueError(
+            f"Unsupported feature '{feature_name}': expected one of rand, text, image, "
+            "image_zero, image_mean, image_learned."
+        )
 
     if node_features.shape[0] != node_count:
         raise ValueError(f"Node feature count mismatch for dataset '{dataset_name}': expected {node_count}, got {node_features.shape[0]}.")
     if edge_features.shape[0] != edge_feature_count:
         raise ValueError(f"Edge feature count mismatch for dataset '{dataset_name}': expected {edge_feature_count}, got {edge_features.shape[0]}.")
 
-    return node_features.astype(np.float32), edge_features.astype(np.float32)
+    return node_features.astype(np.float32), edge_features.astype(np.float32), pair_metadata
+
+
+def _pad_feature_vector(features: np.ndarray, target_dim: int) -> np.ndarray:
+    if features.shape[0] > target_dim:
+        raise ValueError(f"Feature dimension {features.shape[0]} exceeds target dimension {target_dim}.")
+    if features.shape[0] == target_dim:
+        return features.astype(np.float32)
+    return np.pad(features.astype(np.float32), (0, target_dim - features.shape[0]))
+
+
+def _detect_missing_image_mask(cat_features: np.ndarray) -> np.ndarray:
+    if cat_features.shape[1] % 2 != 0:
+        raise ValueError(
+            f"Missing-modality detection requires equal text/image dimensions, got {cat_features.shape[1]} columns."
+        )
+    midpoint = cat_features.shape[1] // 2
+    # Dataset construction duplicates the text embedding into the image half when the image is absent.
+    missing_mask = np.isclose(cat_features[:, midpoint:], cat_features[:, :midpoint]).all(axis=1)
+    if len(missing_mask) > 0:
+        missing_mask[0] = False
+    return missing_mask
+
+
+def _mean_observed_image_embedding(image_features: np.ndarray, missing_mask: np.ndarray) -> np.ndarray:
+    observed_mask = (~missing_mask).copy()
+    if len(observed_mask) > 0:
+        observed_mask[0] = False
+    if observed_mask.any():
+        return image_features[observed_mask].mean(axis=0).astype(np.float32)
+    return np.zeros(image_features.shape[1], dtype=np.float32)
+
+
+def _build_missing_image_features(
+    *,
+    node_cat_features: np.ndarray,
+    edge_cat_features: np.ndarray,
+    node_midpoint: int,
+    edge_midpoint: int,
+    mode: str,
+) -> tuple[np.ndarray, np.ndarray, dict | None]:
+    node_features = node_cat_features[:, node_midpoint:].astype(np.float32).copy()
+    edge_features = edge_cat_features[:, edge_midpoint:].astype(np.float32).copy()
+    node_missing = _detect_missing_image_mask(node_cat_features)
+    edge_missing = _detect_missing_image_mask(edge_cat_features)
+    node_mean = _mean_observed_image_embedding(node_features, node_missing)
+    edge_mean = _mean_observed_image_embedding(edge_features, edge_missing)
+
+    if mode == "image_zero":
+        node_features[node_missing] = 0.0
+        edge_features[edge_missing] = 0.0
+        metadata = None
+    else:
+        node_features[node_missing] = node_mean
+        edge_features[edge_missing] = edge_mean
+        metadata = None
+        if mode == "image_learned":
+            metadata = {
+                "node_missing_mask": node_missing,
+                "edge_missing_mask": edge_missing,
+                "node_init_embedding": node_mean,
+                "edge_init_embedding": edge_mean,
+            }
+
+    # Row zero is reserved padding and must remain zero under every filling strategy.
+    if len(node_features) > 0:
+        node_features[0] = 0.0
+    if len(edge_features) > 0:
+        edge_features[0] = 0.0
+    return node_features, edge_features, metadata
 
 
 def _pad_feature_dim(features: np.ndarray, target_dim: int) -> np.ndarray:

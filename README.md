@@ -33,6 +33,9 @@ In `edge_list.csv`, `u` and `i` are the source and destination node ids, which i
 
 Pass the root with `--data_root` or set `MMDG_DATA_ROOT`. To build a dataset in this format from your own raw data, see [data_construction/README.md](data_construction/README.md).
 
+Full-data variants such as `gdelt_full`, `gmct_full` and `yelp_full` are ordinary dataset
+directories with the same layout; select one by passing its directory name to `--dataset_name`.
+
 ## Usage
 
 ```bash
@@ -50,6 +53,8 @@ python train_edge_classification.py --dataset_name GDELT --model_name DyGFormer 
 
 The defaults match the settings of the paper: seeds 0, 1 and 2, at most 200 epochs, early stopping with a patience of 5 evaluations, and per-model hyperparameters from `utils/load_configs.py`. Use `--help` for all options. `--offload_features` keeps the feature tables in host memory; it does not change the results and saves over 10 GB of GPU memory per process on the larger datasets.
 
+Use `--seeds 3,7,11` to run any explicit set of random seeds. This overrides `--num_runs`.
+
 `scripts/run_benchmark.sh` runs the whole benchmark sequentially.
 
 Results are written under `--output_dir`, by default the current directory:
@@ -60,7 +65,10 @@ saved_results/<model>/<dataset>/<run>.json
 logs/<model>/<dataset>/<run>/run.log
 ```
 
-A run is identified by its task, wrapper, model, features and seed. Running it again with other hyperparameters replaces its checkpoints and results, so use a different `--output_dir` for those.
+A run is identified by its task, wrapper, model, features and seed. Retrieval result names additionally
+include the negative sampler, evaluation protocol and candidate count, so those variants do not
+overwrite or merge with one another. Running other hyperparameter variants may replace existing
+checkpoints and results, so use a different `--output_dir` for those.
 
 In the result files, `test metrics` is the transductive setting and `new node test metrics` is the inductive one. `python -m scripts.collect_results` collects all of them into CSV files.
 
@@ -83,6 +91,28 @@ A method combines a temporal backbone with a multimodal fusion wrapper.
 | TST-MF w/o historical | `DyGFormer` | `tst_mf_no_hist_tracker` |
 
 The fusion wrappers `gated_fusion`, `modality_attention` and `unigraph2` work with any backbone. `--use_feature` joins modalities with `+`, out of `rand`, `text` and `image`.
+
+Missing images are detected directly from the concatenated feature tables: dataset construction
+duplicates the text embedding into the image half when an image is absent. The feature tokens are:
+
+- `text+image_zero`: Zero Filling, replacing detected missing images with zeros;
+- `text+image_mean`: Mean Filling, using the mean observed image embedding;
+- `text+image_learned`: Learned Embedding, initialized to that mean.
+
+Padding row 0 is excluded from missing-image detection and mean computation, and remains zero.
+
+For recurrence-aware node retrieval, evaluate an existing link-prediction checkpoint with:
+
+```bash
+python evaluate_node_retrieval.py --dataset_name gdelt --model_name DyGFormer \
+  --wrapper_name tst_mf --use_feature text+image \
+  --negative_sample_strategy historical \
+  --retrieval_evaluation_protocol recurrence_aware
+```
+
+This reports overall, repeated-edge and novel-edge H@1/H@3/H@10, MRR and mean rank. A directed
+edge is repeated only if the same ordered pair occurred at a strictly earlier timestamp.
+`--num_negative_candidates` controls the sampled candidate count (default: 100).
 
 ### Modality utility
 

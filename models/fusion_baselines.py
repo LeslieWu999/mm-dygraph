@@ -19,8 +19,8 @@ class ConcatWrapper(nn.Module):
         super().__init__()
         assert len(node_raw_features_list) == len(edge_raw_features_list)
         self.model = model_class(
-            node_raw_features=np.concat(node_raw_features_list, axis=-1),
-            edge_raw_features=np.concat(edge_raw_features_list, axis=-1),
+            node_raw_features=np.concatenate(node_raw_features_list, axis=-1),
+            edge_raw_features=np.concatenate(edge_raw_features_list, axis=-1),
             **model_kwargs,
         )
         if hasattr(self.model, "memory_bank"):
@@ -51,6 +51,16 @@ class FusedFeatureView(nn.Module):
 
     def _modalities(self):
         return [getattr(self, f"modality_{i}") for i in range(self.num_modalities)]
+
+    def replace_modalities(self, feature_sources: list[nn.Module]) -> None:
+        """Replace frozen tables with tensor-like modules such as learnable missing embeddings."""
+        if len(feature_sources) != self.num_modalities:
+            raise ValueError(
+                f"Expected {self.num_modalities} feature sources, got {len(feature_sources)}."
+            )
+        for i, source in enumerate(feature_sources):
+            delattr(self, f"modality_{i}")
+            setattr(self, f"modality_{i}", source)
 
     def __getitem__(self, index):
         return self.fuser([feat[index] for feat in self._modalities()])

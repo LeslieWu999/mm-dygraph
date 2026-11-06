@@ -232,8 +232,8 @@ class TSTMF(DyGFormer):
         :param node_raw_features_list: per-modality node features, each (num_nodes, dim)
         :param edge_raw_features_list: per-modality edge features, each (num_edges, dim)
         """
-        node_raw_features = np.concat(node_raw_features_list, axis=-1)
-        edge_raw_features = np.concat(edge_raw_features_list, axis=-1)
+        node_raw_features = np.concatenate(node_raw_features_list, axis=-1)
+        edge_raw_features = np.concatenate(edge_raw_features_list, axis=-1)
 
         self.node_raw_features_list = [torch.from_numpy(nf.astype(np.float32)).to(device) for nf in node_raw_features_list]
         # Only the shapes of the edge tables are used, so they stay on the host.

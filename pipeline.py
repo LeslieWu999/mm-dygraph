@@ -49,6 +49,7 @@ from utils.utils import NegativeEdgeSampler, convert_to_gpu, create_optimizer, g
 class TaskContext:
     node_raw_features_list: list[np.ndarray]
     edge_raw_features_list: list[np.ndarray]
+    feature_metadata: dict | None
     full_data: Data
     train_data: Data
     val_data: Data
@@ -203,7 +204,14 @@ def run_link_retrieval_evaluation(args):
         set_random_seed(seed)
 
         model_run_name = build_run_name("link_prediction", args, seed=seed)
-        result_run_name = build_run_name("node_retrieval", args, seed=seed, negative_sample_strategy=args.negative_sample_strategy)
+        result_run_name = build_run_name(
+            "node_retrieval",
+            args,
+            seed=seed,
+            negative_sample_strategy=args.negative_sample_strategy,
+            retrieval_evaluation_protocol=args.retrieval_evaluation_protocol,
+            num_negative_candidates=args.num_negative_candidates,
+        )
         logger = _start_run_logger(args, result_run_name, "node_retrieval", seed, run_index, context)
         model = build_task_model("link_prediction", args, context)
         model = place_model(model, args, logger)
@@ -233,7 +241,14 @@ def run_link_retrieval_evaluation(args):
         del model, early_stopping, common
         cleanup_after_run(args)
 
-    return _save_summary("node_retrieval_summary", args, run_payloads, negative_sample_strategy=args.negative_sample_strategy)
+    return _save_summary(
+        "node_retrieval_summary",
+        args,
+        run_payloads,
+        negative_sample_strategy=args.negative_sample_strategy,
+        retrieval_evaluation_protocol=args.retrieval_evaluation_protocol,
+        num_negative_candidates=args.num_negative_candidates,
+    )
 
 
 def build_task_context(args) -> TaskContext:
@@ -247,6 +262,7 @@ def build_task_context(args) -> TaskContext:
         new_node_val_data,
         new_node_test_data,
         cat_num,
+        feature_metadata,
     ) = load_temporal_dataset(
         dataset_name=args.dataset_name,
         val_ratio=args.val_ratio,
@@ -274,6 +290,7 @@ def build_task_context(args) -> TaskContext:
     return TaskContext(
         node_raw_features_list=node_raw_features_list,
         edge_raw_features_list=edge_raw_features_list,
+        feature_metadata=feature_metadata,
         full_data=full_data,
         train_data=train_data,
         val_data=val_data,
@@ -300,6 +317,7 @@ def build_task_model(task_name: str, args, context: TaskContext) -> nn.Sequentia
         neighbor_sampler=context.train_neighbor_sampler,
         train_data=context.train_data,
         cat_num=context.cat_num,
+        feature_metadata=context.feature_metadata,
     )
 
 
@@ -424,10 +442,22 @@ def cleanup_after_run(args) -> None:
         torch.cuda.empty_cache()
 
 
-def build_run_name(task_label: str, args, *, seed: int | None = None, negative_sample_strategy: str | None = None) -> str:
+def build_run_name(
+    task_label: str,
+    args,
+    *,
+    seed: int | None = None,
+    negative_sample_strategy: str | None = None,
+    retrieval_evaluation_protocol: str | None = None,
+    num_negative_candidates: int | None = None,
+) -> str:
     parts = [task_label, args.wrapper_name, args.model_name, f"feature-{args.use_feature}"]
     if negative_sample_strategy is not None:
         parts.append(f"negative-{negative_sample_strategy}")
+    if retrieval_evaluation_protocol is not None:
+        parts.append(f"protocol-{retrieval_evaluation_protocol}")
+    if num_negative_candidates is not None:
+        parts.append(f"candidates-{num_negative_candidates}")
     if seed is not None:
         parts.append(f"seed-{seed}")
     return sanitize_name("__".join(parts))
@@ -476,9 +506,24 @@ def _log_bundle(logger, bundle: dict) -> None:
             _log_metric_dict(logger, prefix, bundle[metrics_key])
 
 
-def _save_summary(task_label: str, args, run_payloads: list[dict], *, negative_sample_strategy: str | None = None) -> dict:
+def _save_summary(
+    task_label: str,
+    args,
+    run_payloads: list[dict],
+    *,
+    negative_sample_strategy: str | None = None,
+    retrieval_evaluation_protocol: str | None = None,
+    num_negative_candidates: int | None = None,
+) -> dict:
     seed = args.seeds[0] if len(args.seeds) == 1 else None
-    summary_name = build_run_name(task_label, args, seed=seed, negative_sample_strategy=negative_sample_strategy)
+    summary_name = build_run_name(
+        task_label,
+        args,
+        seed=seed,
+        negative_sample_strategy=negative_sample_strategy,
+        retrieval_evaluation_protocol=retrieval_evaluation_protocol,
+        num_negative_candidates=num_negative_candidates,
+    )
     payload = _build_summary_payload(run_payloads, seeds=args.seeds)
     save_json(_build_result_path(args, summary_name), payload)
     return payload

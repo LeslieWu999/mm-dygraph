@@ -33,6 +33,19 @@ def get_link_prediction_args(argv: list[str] | None = None) -> argparse.Namespac
         choices=["random", "historical", "inductive"],
         help="negative edge sampling strategy of node retrieval",
     )
+    parser.add_argument(
+        "--retrieval_evaluation_protocol",
+        type=str,
+        default="sampled",
+        choices=["sampled", "recurrence_aware"],
+        help="sampled metrics, or additionally stratify queries into repeated and novel directed edges",
+    )
+    parser.add_argument(
+        "--num_negative_candidates",
+        type=int,
+        default=100,
+        help="number of sampled destination candidates per retrieval query",
+    )
     return _parse_args(parser, "link_prediction", argv)
 
 
@@ -47,7 +60,14 @@ def _build_common_parser(description: str) -> argparse.ArgumentParser:
     group.add_argument("--dataset_name", type=str, required=True, help="dataset directory name under the data root, or a path to it")
     group.add_argument("--model_name", type=str, required=True, choices=sorted(BACKBONE_REGISTRY), help="temporal backbone (SALoM is 'Liquid')")
     group.add_argument("--wrapper_name", type=str, default="concat", choices=WRAPPER_NAMES, help="multimodal fusion wrapper")
-    group.add_argument("--use_feature", type=str, default="text+image", help="'+'-joined modalities out of rand, text, image, e.g. text+image")
+    group.add_argument(
+        "--use_feature",
+        type=str,
+        default="text+image",
+        help=(
+            "'+'-joined modalities out of rand, text, image, image_zero, image_mean, image_learned"
+        ),
+    )
     group.add_argument("--data_root", type=str, default=None, help="dataset root directory, defaults to $MMDG_DATA_ROOT")
     group.add_argument("--output_dir", type=str, default=".", help="directory for saved_models/, saved_results/ and logs/")
     group.add_argument("--seeds", type=str, default=None, help="comma-separated random seeds, overrides --num_runs")
@@ -126,6 +146,8 @@ def _parse_args(parser: argparse.ArgumentParser, task_name: str, argv: list[str]
         parser.error(f"expected val_ratio and test_ratio in (0, 1) with a sum below 1, got {args.val_ratio} and {args.test_ratio}")
     if args.wrapper_name.startswith("tst_mf") and args.model_name != "DyGFormer":
         parser.error(f"--wrapper_name {args.wrapper_name} requires --model_name DyGFormer")
+    if hasattr(args, "num_negative_candidates") and args.num_negative_candidates <= 0:
+        parser.error(f"expected num_negative_candidates > 0, got {args.num_negative_candidates}")
     args.device = f"cuda:{args.gpu}" if torch.cuda.is_available() and args.gpu >= 0 else "cpu"
     args.use_feature = args.use_feature.strip()
     args.seeds = _resolve_seeds(parser, args.seeds, args.num_runs)

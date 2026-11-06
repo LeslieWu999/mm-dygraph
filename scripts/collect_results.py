@@ -22,7 +22,8 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-# saved_results/<model_dir>/<dataset>/<task>__<wrapper>__<model>__feature-xxx[__negative-xxx][__seed-N].json
+# saved_results/<model_dir>/<dataset>/<task>__<wrapper>__<model>__feature-xxx
+#   [__negative-xxx][__protocol-xxx][__candidates-N][__seed-N].json
 FILENAME_RE = re.compile(r"^(?P<task>[a-z_]+?)(?P<summary>_summary)?__(?P<rest>.+)\.json$")
 
 
@@ -42,6 +43,8 @@ def parse_filename(path: Path):
         "model": tokens[1],
         "feature": None,
         "negative_sample_strategy": None,
+        "retrieval_evaluation_protocol": None,
+        "num_negative_candidates": None,
         "seed": None,
     }
     for token in tokens[2:]:
@@ -49,8 +52,17 @@ def parse_filename(path: Path):
             info["feature"] = token[len("feature-"):]
         elif token.startswith("negative-"):
             info["negative_sample_strategy"] = token[len("negative-"):]
+        elif token.startswith("protocol-"):
+            info["retrieval_evaluation_protocol"] = token[len("protocol-"):]
+        elif token.startswith("candidates-"):
+            info["num_negative_candidates"] = int(token[len("candidates-"):])
         elif token.startswith("seed-"):
             info["seed"] = int(token[len("seed-"):])
+
+    # Results created before these fields were added used the sampled protocol with 100 candidates.
+    if info["task"] == "node_retrieval":
+        info["retrieval_evaluation_protocol"] = info["retrieval_evaluation_protocol"] or "sampled"
+        info["num_negative_candidates"] = info["num_negative_candidates"] or 100
 
     # The dataset is everything between the model directory and the file name.
     parts = path.parts
@@ -133,7 +145,16 @@ def collect(root: Path, args):
     return runs
 
 
-GROUP_KEYS = ["task", "dataset", "model", "wrapper", "feature", "negative_sample_strategy"]
+GROUP_KEYS = [
+    "task",
+    "dataset",
+    "model",
+    "wrapper",
+    "feature",
+    "negative_sample_strategy",
+    "retrieval_evaluation_protocol",
+    "num_negative_candidates",
+]
 META_KEYS = GROUP_KEYS + ["seed", "finished_at", "path"]
 
 
