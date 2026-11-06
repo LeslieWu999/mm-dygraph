@@ -1,0 +1,7 @@
+# Tested with Python 3.10 and the versions below.
+torch==2.8.0
+numpy==2.2.6
+pandas==2.3.2
+scikit-learn==1.7.1
+tqdm==4.67.1
+ncps==1.0.1  # SALoM

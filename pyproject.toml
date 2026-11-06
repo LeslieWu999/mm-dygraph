@@ -1,0 +1,11 @@
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 160
+# Third-party model code, kept as published (see THIRD_PARTY_NOTICES.md).
+extend-exclude = ["models/CAWN.py", "models/DyGFormer.py", "models/FreeDyG.py", "models/GraphMixer.py", "models/Liquid.py", "models/MemoryModel.py", "models/TCL.py", "models/TGAT.py", "models/TPNet.py", "models/ccffcc.py", "models/modules.py", "models/moe.py", "utils/utils.py"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]

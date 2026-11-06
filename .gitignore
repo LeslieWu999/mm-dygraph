@@ -1,0 +1,18 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.DS_Store
+tests/
+
+# experiment outputs
+saved_models/
+saved_results/
+logs/
+results*.csv
+results*.json
+
+# datasets
+*.npy
+*.npz
+data/
