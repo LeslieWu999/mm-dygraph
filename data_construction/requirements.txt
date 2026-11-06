@@ -1,0 +1,9 @@
+# Needed by the dataset-construction scripts on top of the training requirements
+# (torch, numpy, pandas, tqdm).
+aiohttp
+orjson
+pillow
+transformers
+
+# Only used to serve the scoring model; it can live in a separate environment.
+vllm

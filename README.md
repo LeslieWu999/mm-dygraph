@@ -15,7 +15,7 @@ pip install -r requirements.txt
 
 ## Data
 
-The datasets are available on [Hugging Face](https://huggingface.co/datasets/LeslieWu999/MM-DyGraph).
+The datasets are available on [Hugging Face](https://huggingface.co/datasets/LeslieWu999/MM-DyGraph). They are derived from GDELT, Google Local, Amazon Reviews 2023 and the Yelp Open Dataset.
 
 Each one is a directory under a common root:
 
@@ -31,7 +31,7 @@ Each one is a directory under a common root:
 
 In `edge_list.csv`, `u` and `i` are the source and destination node ids, which index the rows of the node feature tables, and `r` is the edge id, which indexes the rows of the edge feature tables. Node id 0 is reserved for padding.
 
-Pass the root with `--data_root` or set `MMDG_DATA_ROOT`. To build the datasets from raw data, see [data_construction/README.md](data_construction/README.md).
+Pass the root with `--data_root` or set `MMDG_DATA_ROOT`. To build a dataset in this format from your own raw data, see [data_construction/README.md](data_construction/README.md).
 
 ## Usage
 
@@ -101,7 +101,7 @@ models/                                  backbones (see THIRD_PARTY_NOTICES.md),
                                          fusion_baselines.py, adapters.py
 utils/                                   data loading, arguments, model construction, metrics
 scripts/                                 result collection and analyses
-data_construction/                       scripts that built the datasets
+data_construction/                       scripts that turn raw data into this format
 ```
 
 ## Third-party code
