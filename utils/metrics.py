@@ -23,20 +23,28 @@ def get_link_prediction_metrics(predicts: torch.Tensor, labels: torch.Tensor):
 
 def get_retrieval_metrics(pos_scores, neg_scores):
     """``neg_scores`` holds one array per negative candidate, each with one score per source."""
+    return get_retrieval_metrics_from_ranks(get_retrieval_ranks(pos_scores, neg_scores))
+
+
+def get_retrieval_ranks(pos_scores, neg_scores) -> np.ndarray:
+    """Return one-based target ranks, resolving score ties in the target's favour."""
     positive_values = _to_numpy(pos_scores)
+    if not neg_scores:
+        return np.ones(len(positive_values), dtype=np.int64)
     negative_values = np.stack([_to_numpy(scores) for scores in neg_scores], axis=1)
+    return 1 + np.sum(negative_values > positive_values[:, None], axis=1)
 
-    h1_scores, h3_scores, h10_scores = [], [], []
-    for index, positive_score in enumerate(positive_values):
-        rank = get_rank(positive_score, negative_values[index])
-        h1_scores.append(int(rank <= 1))
-        h3_scores.append(int(rank <= 3))
-        h10_scores.append(int(rank <= 10))
 
+def get_retrieval_metrics_from_ranks(ranks) -> dict[str, float]:
+    rank_values = np.asarray(ranks, dtype=np.float64)
+    if rank_values.size == 0:
+        return {"H1": 0.0, "H3": 0.0, "H10": 0.0, "MRR": 0.0, "mean_rank": 0.0}
     return {
-        "H1": float(np.mean(h1_scores)) if h1_scores else 0.0,
-        "H3": float(np.mean(h3_scores)) if h3_scores else 0.0,
-        "H10": float(np.mean(h10_scores)) if h10_scores else 0.0,
+        "H1": float(np.mean(rank_values <= 1)),
+        "H3": float(np.mean(rank_values <= 3)),
+        "H10": float(np.mean(rank_values <= 10)),
+        "MRR": float(np.mean(1.0 / rank_values)),
+        "mean_rank": float(np.mean(rank_values)),
     }
 
 

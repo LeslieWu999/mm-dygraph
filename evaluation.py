@@ -17,7 +17,14 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from utils.data import Data, slice_batch
-from utils.metrics import get_edge_classification_metrics, get_link_prediction_metrics, get_retrieval_metrics, mean_metric_dicts, mean_value
+from utils.metrics import (
+    get_edge_classification_metrics,
+    get_link_prediction_metrics,
+    get_retrieval_metrics_from_ranks,
+    get_retrieval_ranks,
+    mean_metric_dicts,
+    mean_value,
+)
 from utils.modeling import (
     backup_memory,
     compute_positive_and_negative_embeddings,
@@ -31,8 +38,6 @@ from utils.modeling import (
     update_tpnet_projections,
 )
 from utils.utils import NegativeEdgeSampler
-
-NUM_RETRIEVAL_NEGATIVES = 100
 
 
 def evaluate_model_link_prediction(
@@ -96,6 +101,9 @@ def evaluate_model_retrieval(
     loss_func: nn.Module,
     num_neighbors: int = 20,
     time_gap: int = 2000,
+    retrieval_evaluation_protocol: str = "sampled",
+    num_negative_candidates: int = 100,
+    recurrence_history_data: Data | None = None,
 ):
     """Node retrieval: ranks each true destination against the same sampled negatives for the whole batch."""
     assert evaluate_neg_edge_sampler.seed is not None
@@ -104,6 +112,8 @@ def evaluate_model_retrieval(
     backbone = model[0]
     set_neighbor_sampler(backbone, model_name, neighbor_sampler)
     model.eval()
+    if retrieval_evaluation_protocol not in {"sampled", "recurrence_aware"}:
+        raise ValueError(f"Unsupported retrieval evaluation protocol: {retrieval_evaluation_protocol}")
 
     embed = partial(compute_temporal_embeddings, backbone=backbone, model_name=model_name, num_neighbors=num_neighbors, time_gap=time_gap)
 
@@ -111,16 +121,33 @@ def evaluate_model_retrieval(
         scores = []
         for negative_dst_node_id in negative_dst_node_ids:
             repeated_dst_ids = np.repeat(negative_dst_node_id, len(src))
-            neg_src_emb, neg_dst_emb = embed(src_node_ids=src, dst_node_ids=repeated_dst_ids, node_interact_times=times, edge_ids=None, edges_are_positive=False)
+            neg_src_emb, neg_dst_emb = embed(
+                src_node_ids=src,
+                dst_node_ids=repeated_dst_ids,
+                node_interact_times=times,
+                edge_ids=None,
+                edges_are_positive=False,
+            )
             scores.append(predict_link_probabilities(model, neg_src_emb, neg_dst_emb))
         return scores
 
-    evaluate_losses, evaluate_metrics = [], []
+    evaluate_losses, all_ranks, recurrence_flags = [], [], []
+    if recurrence_evaluation := retrieval_evaluation_protocol == "recurrence_aware":
+        history = recurrence_history_data or evaluate_data
+        first_seen_time = _first_seen_edge_times(
+            history.src_node_ids,
+            history.dst_node_ids,
+            history.node_interact_times,
+        )
+    else:
+        first_seen_time = None
     with torch.no_grad():
         progress_bar = tqdm(evaluate_idx_data_loader, ncols=120)
         for batch_index, evaluate_data_indices in enumerate(progress_bar):
             src, dst, times, edge_ids, _ = slice_batch(evaluate_data, evaluate_data_indices.numpy())
-            _, negative_dst_node_ids = _sample_negatives(evaluate_neg_edge_sampler, NUM_RETRIEVAL_NEGATIVES, src, dst, times)
+            _, negative_dst_node_ids = _sample_negatives(
+                evaluate_neg_edge_sampler, num_negative_candidates, src, dst, times
+            )
 
             (src_emb, dst_emb), negative_probabilities = forward_in_streaming_order(
                 backbone,
@@ -138,10 +165,81 @@ def evaluate_model_retrieval(
 
             loss = loss_func(input=predicts, target=labels)
             evaluate_losses.append(loss.item())
-            evaluate_metrics.append(get_retrieval_metrics(positive_probabilities, negative_probabilities))
+            all_ranks.extend(get_retrieval_ranks(positive_probabilities, negative_probabilities).tolist())
+            if recurrence_evaluation:
+                recurrence_flags.extend(
+                    _classify_recurrent_edges_from_first_seen(src, dst, times, first_seen_time).tolist()
+                )
             progress_bar.set_description(f"evaluate batch {batch_index + 1}, evaluate loss: {loss.item():.4f}")
 
-    return evaluate_losses, evaluate_metrics
+    if not all_ranks:
+        return evaluate_losses, []
+
+    metrics = build_retrieval_metrics(
+        all_ranks,
+        recurrence_flags if retrieval_evaluation_protocol == "recurrence_aware" else None,
+        num_negative_candidates=num_negative_candidates,
+    )
+    return evaluate_losses, [metrics]
+
+
+def build_retrieval_metrics(
+    ranks, recurrence_flags=None, *, num_negative_candidates: int
+) -> dict[str, float]:
+    rank_values = np.asarray(ranks)
+    metrics = get_retrieval_metrics_from_ranks(rank_values)
+    metrics["num_queries"] = len(rank_values)
+    metrics["num_negative_candidates"] = num_negative_candidates
+    if recurrence_flags is None:
+        return metrics
+
+    repeated = np.asarray(recurrence_flags, dtype=bool)
+    if len(repeated) != len(rank_values):
+        raise ValueError("recurrence_flags must have one value per rank")
+    for name, value in get_retrieval_metrics_from_ranks(rank_values[repeated]).items():
+        metrics[f"repeated_{name}"] = value
+    for name, value in get_retrieval_metrics_from_ranks(rank_values[~repeated]).items():
+        metrics[f"novel_{name}"] = value
+    metrics["num_repeated_queries"] = int(repeated.sum())
+    metrics["num_novel_queries"] = int((~repeated).sum())
+    return metrics
+
+
+def classify_recurrent_edges(
+    src_node_ids,
+    dst_node_ids,
+    interact_times,
+    history_src_node_ids,
+    history_dst_node_ids,
+    history_interact_times,
+) -> np.ndarray:
+    """Classify directed query edges as repeated only if they occurred at a strictly earlier time."""
+    return _classify_recurrent_edges_from_first_seen(
+        src_node_ids,
+        dst_node_ids,
+        interact_times,
+        _first_seen_edge_times(history_src_node_ids, history_dst_node_ids, history_interact_times),
+    )
+
+
+def _first_seen_edge_times(src_node_ids, dst_node_ids, interact_times) -> dict[tuple[int, int], float]:
+    first_seen_time = {}
+    for src, dst, time in zip(src_node_ids, dst_node_ids, interact_times):
+        pair = (int(src), int(dst))
+        first_seen_time[pair] = min(float(time), first_seen_time.get(pair, float("inf")))
+    return first_seen_time
+
+
+def _classify_recurrent_edges_from_first_seen(
+    src_node_ids, dst_node_ids, interact_times, first_seen_time: dict[tuple[int, int], float]
+) -> np.ndarray:
+    return np.asarray(
+        [
+            first_seen_time.get((int(src), int(dst)), float("inf")) < float(time)
+            for src, dst, time in zip(src_node_ids, dst_node_ids, interact_times)
+        ],
+        dtype=bool,
+    )
 
 
 def evaluate_model_edge_classification(
@@ -221,7 +319,7 @@ def build_evaluation_samplers(context, negative_sample_strategy: str = "random")
 
 
 def evaluate_split(*, evaluator, model, args, context, samplers, loss_func, loader, sampler_key, data):
-    losses, metrics = evaluator(
+    kwargs = dict(
         model_name=args.model_name,
         model=model,
         neighbor_sampler=context.full_neighbor_sampler,
@@ -232,6 +330,13 @@ def evaluate_split(*, evaluator, model, args, context, samplers, loss_func, load
         num_neighbors=args.num_neighbors,
         time_gap=args.time_gap,
     )
+    if evaluator is evaluate_model_retrieval:
+        kwargs.update(
+            retrieval_evaluation_protocol=getattr(args, "retrieval_evaluation_protocol", "sampled"),
+            num_negative_candidates=getattr(args, "num_negative_candidates", 100),
+            recurrence_history_data=context.full_data,
+        )
+    losses, metrics = evaluator(**kwargs)
     return mean_value(losses), mean_metric_dicts(metrics)
 
 
@@ -309,8 +414,12 @@ def evaluate_final_edge(model, args, context, loss_func) -> dict:
     """Final evaluation of a loaded checkpoint; streaming models skip validation as in ``evaluate_final_link``."""
     payload = {}
     if not has_streaming_state(args.model_name):
-        payload["validate loss"], payload["validate metrics"] = evaluate_edge_split(model, args, context, loss_func, context.val_idx_data_loader, context.val_data)
-    payload["test loss"], payload["test metrics"] = evaluate_edge_split(model, args, context, loss_func, context.test_idx_data_loader, context.test_data)
+        payload["validate loss"], payload["validate metrics"] = evaluate_edge_split(
+            model, args, context, loss_func, context.val_idx_data_loader, context.val_data
+        )
+    payload["test loss"], payload["test metrics"] = evaluate_edge_split(
+        model, args, context, loss_func, context.test_idx_data_loader, context.test_data
+    )
     return payload
 
 
